@@ -8,7 +8,7 @@ from torch.utils.data import Dataset
 from torch.nn import functional as F
 
 from .datasets import register_dataset
-from .data_utils import truncate_feats, truncate_feats_with_points
+from .data_utils import truncate_feats
 from ..utils import remove_duplicate_annotations
 
 @register_dataset("anet")
@@ -78,9 +78,6 @@ class ActivityNetDataset(Dataset):
             'empty_label_ids': []
         }
 
-        # load point_label
-        self.point_dict = self._load_point_label()
-
     def get_attributes(self):
         return self.db_attributes
 
@@ -138,74 +135,6 @@ class ActivityNetDataset(Dataset):
 
         return dict_db, label_dict
 
-
-    def _load_point_label(self, csv_file='/home/yunchuan/HR-Pro/dataset/ActivityNet1.3/point_labels/point_gaussian.csv'):
-        with open('/home/yunchuan/HR-Pro/dataset/ActivityNet1.3/gt_full.json', 'rb') as f:
-            gt = json.load(f)['database']
-
-        import pandas as pd
-        # 读取 CSV 文件
-        data = pd.read_csv(csv_file)
-
-        # # 打印数据的前几行来查看
-        # print(data.head())
-        # 创建一个空字典来存储数据
-        video_dict = {}
-
-        # 遍历 DataFrame 的每一行
-        for index, row in data.iterrows():
-            video_id = row['video_id']
-
-            # 如果字典中没有这个 video_id 的键，创建一个空列表
-            if video_id not in video_dict:
-                video_dict[video_id] = []
-
-            # 将行信息以字典形式添加到对应的列表中
-            video_dict[video_id].append({
-                'class': row['class'],
-                'start_frame': row['start_frame'],
-                'stop_frame': row['stop_frame'],
-                'point': row['point'],
-                'point_time': row['point'] / gt[video_id]['fps']
-            })
-        return video_dict
-
-    def match_and_order_points_by_segments(self, segments, point_list):
-        """
-        将 point_list 中的点按 segments 的顺序排列，确保每个 point_time 落在对应 segment 内。
-
-        参数:
-            segments (np.ndarray): shape [N, 2] 的 segment 数组
-            point_list (List[Dict]): 每个元素包含 'point_time' 键
-
-        返回:
-            ordered_points (List[Dict]): 匹配并排序后的 point_list
-        """
-        unused_points = point_list.copy()
-        ordered_points = []
-
-        for seg_idx, (seg_start, seg_end) in enumerate(segments):
-            match_found = False
-            for i, pt_entry in enumerate(unused_points):
-                pt = pt_entry['point_time']
-                if seg_start <= pt <= seg_end:
-                    # ordered_points.append(pt_entry)
-                    ordered_points.append(pt)
-                    del unused_points[i]
-                    match_found = True
-                    break
-            if not match_found:
-                print(f"⚠️ Segment {seg_idx}: No point_time found in segment ({seg_start}, {seg_end})")
-
-        assert len(ordered_points) == len(segments)
-        # if len(ordered_points) != len(segments):
-        #     print(f"❌ Mismatch: {len(ordered_points)} points matched for {len(segments)} segments.")
-        # else:
-        #     print("✅ All segments matched with corresponding point_time.")
-
-        return ordered_points
-
-
     def __len__(self):
         return len(self.data_list)
 
@@ -214,15 +143,6 @@ class ActivityNetDataset(Dataset):
         # auto batching will be disabled in the subsequent dataloader
         # instead the model will need to decide how to batch / preporcess the data
         video_item = self.data_list[idx]
-
-        # if video_item['id']=='aOzMA2rpWEw':
-        #     print(123)
-
-        # 匹配点和segment
-        if self.is_training:
-            segments = video_item['segments']
-            points = self.point_dict['v_' + video_item['id']]
-            ordered_points = self.match_and_order_points_by_segments(segments, points)
 
         # load features
         if self.use_hdf5:
@@ -285,20 +205,12 @@ class ActivityNetDataset(Dataset):
                 video_item['segments'] * video_item['fps'] / feat_stride - feat_offset
             )
             labels = torch.from_numpy(video_item['labels'])
-
-            points = None
-            if self.is_training:
-                # 转化point从时间到特征索引
-                points = torch.from_numpy(np.array(ordered_points) * video_item['fps'] / feat_stride - feat_offset)
-
             # for activity net, we have a few videos with a bunch of missing frames
             # here is a quick fix for training
             if self.is_training:
                 vid_len = feats.shape[1] + feat_offset
                 valid_seg_list, valid_label_list = [], []
-
-                valid_point_list = []
-                for seg, label, point in zip(segments, labels, points):
+                for seg, label in zip(segments, labels):
                     if seg[0] >= vid_len:
                         # skip an action outside of the feature map
                         continue
@@ -311,17 +223,10 @@ class ActivityNetDataset(Dataset):
                         valid_seg_list.append(seg.clamp(max=vid_len))
                         # some weird bug here if not converting to size 1 tensor
                         valid_label_list.append(label.view(1))
-                        #
-                        valid_point_list.append(point.clamp(max=vid_len))
-
                 segments = torch.stack(valid_seg_list, dim=0)
                 labels = torch.cat(valid_label_list)
-                #
-                points = torch.stack(valid_point_list)
         else:
             segments, labels = None, None
-
-            points = None
 
         # return a data dict
         data_dict = {'video_id'        : video_item['id'],
@@ -331,22 +236,13 @@ class ActivityNetDataset(Dataset):
                      'fps'             : video_item['fps'],
                      'duration'        : video_item['duration'],
                      'feat_stride'     : feat_stride,
-                     'feat_num_frames' : num_frames,
-                     'points'          : points }
+                     'feat_num_frames' : num_frames}
 
         # no truncation is needed
         # truncate the features during training
         if self.is_training and (segments is not None):
-            # data_dict = truncate_feats(
-            #     data_dict, self.max_seq_len, self.trunc_thresh, feat_offset, self.crop_ratio
-            # )
-
-            data_dict = truncate_feats_with_points(
+            data_dict = truncate_feats(
                 data_dict, self.max_seq_len, self.trunc_thresh, feat_offset, self.crop_ratio
             )
 
         return data_dict
-
-
-
-

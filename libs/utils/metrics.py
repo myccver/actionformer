@@ -31,14 +31,18 @@ def remove_duplicate_annotations(ants, tol=1e-3):
     return valid_events
 
 
-def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=0):
+def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=0, blocked_videos=None):
     # load json file
     with open(json_file, "r", encoding="utf8") as f:
         json_db = json.load(f)
     json_db = json_db['database']
 
+
     vids, starts, stops, labels = [], [], [], []
     for k, v in json_db.items():
+        # 移除blocked_videos
+        if k in blocked_videos:
+            continue
 
         # filter based on split
         if (split is not None) and v['subset'].lower() != split:
@@ -72,14 +76,18 @@ def load_gt_seg_from_json(json_file, split=None, label='label_id', label_offset=
     return gt_base
 
 
-def load_pred_seg_from_json(json_file, label='label_id', label_offset=0):
+def load_pred_seg_from_json(json_file, label='label_id', label_offset=0, blocked_videos=None):
     # load json file
     with open(json_file, "r", encoding="utf8") as f:
         json_db = json.load(f)
     json_db = json_db['database']
 
+
     vids, starts, stops, labels, scores = [], [], [], [], []
     for k, v, in json_db.items():
+        # 移除blocked_videos
+        if k in blocked_videos:
+            continue
         # video id
         vids += [k] * len(v)
         # for each event
@@ -135,8 +143,10 @@ class ANETdetection(object):
 
         # Import ground truth and predictions
         self.split = split
+        # 移除blocked_videos
+        self.blocked_videos = ['video_test_0000270','video_test_0001292','video_test_0001496']
         self.ground_truth = load_gt_seg_from_json(
-            ant_file, split=self.split, label=label, label_offset=label_offset)
+            ant_file, split=self.split, label=label, label_offset=label_offset, blocked_videos=self.blocked_videos)
 
         # remove labels that does not exists in gt
         self.activity_index = {j: i for i, j in enumerate(sorted(self.ground_truth['label'].unique()))}
@@ -207,7 +217,7 @@ class ANETdetection(object):
         if isinstance(preds, pd.DataFrame):
             assert 'label' in preds
         elif isinstance(preds, str) and os.path.isfile(preds):
-            preds = load_pred_seg_from_json(preds)
+            preds = load_pred_seg_from_json(preds, blocked_videos=self.blocked_videos)
         elif isinstance(preds, Dict):
             # move to pd dataframe
             # did not check dtype here, can accept both numpy / pytorch tensors
@@ -237,14 +247,36 @@ class ANETdetection(object):
             print('[RESULTS] Action detection results on {:s}.'.format(
                 self.dataset_name)
             )
-            block = ''
-            for tiou, tiou_mAP, tiou_mRecall in zip(self.tiou_thresholds, mAP, mRecall):
-                block += '\n|tIoU = {:.2f}: '.format(tiou)
-                block += 'mAP = {:>4.2f} (%) '.format(tiou_mAP*100)
-                for idx, k in enumerate(self.top_k):
-                    block += 'Recall@{:d}x = {:>4.2f} (%) '.format(k, tiou_mRecall[idx]*100)
-            print(block)
-            print('Average mAP: {:>4.2f} (%)'.format(average_mAP*100))
+            # block = ''
+            # for tiou, tiou_mAP, tiou_mRecall in zip(self.tiou_thresholds, mAP, mRecall):
+            #     block += '\n|tIoU = {:.2f}: '.format(tiou)
+            #     block += 'mAP = {:>4.2f} (%) '.format(tiou_mAP*100)
+            #     for idx, k in enumerate(self.top_k):
+            #         block += 'Recall@{:d}x = {:>4.2f} (%) '.format(k, tiou_mRecall[idx]*100)
+            # print(block)
+            # print('Average mAP: {:>4.2f} (%)'.format(average_mAP*100))
+        if len(mAP)==7:
+            print("-------------------------------------------------------------------------------")
+            print('|t-IoU |{}|'.format("||".join(["{:.3f}".format(item) for item in self.tiou_thresholds])))
+            print("-------------------------------------------------------------------------------")
+            print('|mAP   |{}|'.format("||".join(["{:.3f}".format(item) for item in mAP])))
+            print("-------------------------------------------------------------------------------")
+            print('|Average-mAP: {:.4f} Average mAP[0.1:0.5]:{:.4f} Average mAP[0.3:0.7]:{:.4f}'.
+                  format(average_mAP, mAP[:5].mean(), mAP[2:7].mean()))
+            print("-------------------------------------------------------------------------------")
+        if len(mAP)==10:
+            print("-------------------------------------------------------------------------------")
+            print('|t-IoU |{}|'.format("||".join(["{:.3f}".format(item) for item in self.tiou_thresholds])))
+            print("-------------------------------------------------------------------------------")
+            print('|mAP   |{}|'.format("||".join(["{:.3f}".format(item) for item in mAP])))
+            print("-------------------------------------------------------------------------------")
+            print('|Average-mAP[0.5:0.95]: {:.3f}'.
+                  format(average_mAP))
+            print("-------------------------------------------------------------------------------")
+
+
+
+
 
         # return the results
         return mAP, average_mAP, mRecall

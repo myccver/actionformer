@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 # our code
 from libs.core import load_config
-from libs.datasets import make_dataset, make_data_loader
+from libs.datasets import make_dataset, make_data_loader # libs.datasets.anet 有一行from ..utils import remove_duplicate_annotations 在这里注册了剩下的全部，因为有from .train_utils import *
 from libs.modeling import make_meta_arch
 from libs.utils import (train_one_epoch, valid_one_epoch, ANETdetection,
                         save_checkpoint, make_optimizer, make_scheduler,
@@ -65,15 +65,37 @@ def main(args):
     train_db_vars = train_dataset.get_attributes()
     cfg['model']['train_cfg']['head_empty_cls'] = train_db_vars['empty_label_ids']
 
+
     # data loaders
     train_loader = make_data_loader(
         train_dataset, True, rng_generator, **cfg['loader'])
+
+    # 准备测试
+    val_dataset = make_dataset(
+        cfg['dataset_name'], False, cfg['val_split'], **cfg['dataset']
+    )
+    # set bs = 1, and disable shuffle
+    val_loader = make_data_loader(
+        val_dataset, False, None, 1, cfg['loader']['num_workers']
+    )
+
+    # set up evaluator
+    val_db_vars = val_dataset.get_attributes()
+    det_eval = ANETdetection(
+        val_dataset.json_file,
+        val_dataset.split[0],
+        tiou_thresholds=val_db_vars['tiou_thresholds']
+    )
+    best_mAP = 0
+
+    #------------------------------
 
     """3. create model, optimizer, and scheduler"""
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
     # not ideal for multi GPU training, ok for now
-    model = nn.DataParallel(model, device_ids=cfg['devices'])
+    #model = nn.DataParallel(model, device_ids=cfg['devices'])
+    model = model.to(cfg['devices'][0])
     # optimizer
     optimizer = make_optimizer(model, cfg['opt'])
     # schedule
@@ -133,25 +155,62 @@ def main(args):
             print_freq=args.print_freq
         )
 
-        # save ckpt once in a while
-        if (
-            ((epoch + 1) == max_epochs) or
-            ((args.ckpt_freq > 0) and ((epoch + 1) % args.ckpt_freq == 0))
-        ):
-            save_states = {
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'optimizer': optimizer.state_dict(),
-            }
+        # # save ckpt once in a while
+        # if (
+        #     ((epoch + 1) == max_epochs) or
+        #     ((args.ckpt_freq > 0) and ((epoch + 1) % args.ckpt_freq == 0))
+        # ):
+        #     save_states = {
+        #         'epoch': epoch + 1,
+        #         'state_dict': model.state_dict(),
+        #         'scheduler': scheduler.state_dict(),
+        #         'optimizer': optimizer.state_dict(),
+        #     }
+        #
+        #     save_states['state_dict_ema'] = model_ema.module.state_dict()
+        #     save_checkpoint(
+        #         save_states,
+        #         False,
+        #         file_folder=ckpt_folder,
+        #         file_name='epoch_{:03d}.pth.tar'.format(epoch + 1)
+        #     )
 
-            save_states['state_dict_ema'] = model_ema.module.state_dict()
-            save_checkpoint(
-                save_states,
-                False,
-                file_folder=ckpt_folder,
-                file_name='epoch_{:03d}.pth.tar'.format(epoch + 1)
+        # 设定测试
+        if (
+                ((epoch + 1) == max_epochs) or
+                ((args.ckpt_freq > 0) and ((epoch + 1) % args.ckpt_freq == 0))
+        ):
+            mAP = valid_one_epoch(
+                val_loader,
+                model_ema.module,
+                -1,
+                evaluator=det_eval,
+                output_file=os.path.join(ckpt_folder, 'eval_results.pkl'),
+                ext_score_file=cfg['test_cfg']['ext_score_file'],
+                tb_writer=None,
+                print_freq=args.print_freq,
+                cfg=cfg,
+
             )
+            if mAP > best_mAP:
+                best_mAP = mAP
+                save_states = {
+                    'epoch': epoch + 1,
+                    'state_dict': model.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                }
+
+                save_states['state_dict_ema'] = model_ema.module.state_dict()
+                save_checkpoint(
+                    save_states,
+                    False,
+                    file_folder=ckpt_folder,
+                    file_name='epoch_{:03d}.pth.tar'.format(epoch + 1)
+                )
+
+
+
 
     # wrap up
     tb_writer.close()
@@ -168,11 +227,15 @@ if __name__ == '__main__':
                         help='path to a config file')
     parser.add_argument('-p', '--print-freq', default=10, type=int,
                         help='print frequency (default: 10 iterations)')
-    parser.add_argument('-c', '--ckpt-freq', default=5, type=int,
+    parser.add_argument('-c', '--ckpt-freq', default=35, type=int,
                         help='checkpoint frequency (default: every 5 epochs)')
     parser.add_argument('--output', default='', type=str,
                         help='name of exp folder (default: none)')
     parser.add_argument('--resume', default='', type=str, metavar='PATH',
                         help='path to a checkpoint (default: none)')
     args = parser.parse_args()
+    start_time = time.time()
     main(args)
+    end_time = time.time()
+    duration = end_time-start_time
+    print('total training time is {:.2f} seconds'.format(duration))

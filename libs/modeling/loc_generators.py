@@ -78,6 +78,7 @@ class PointGenerator(nn.Module):
         pts_list = []
         feat_lens = [feat.shape[-1] for feat in feats]
         for feat_len, buffer_pts in zip(feat_lens, self.buffer_points):
+            #print(feat_len)
             assert feat_len <= buffer_pts.shape[0], "Reached max buffer length for point generator"
             pts = buffer_pts[:feat_len, :]
             pts_list.append(pts)

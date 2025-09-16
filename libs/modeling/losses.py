@@ -155,7 +155,7 @@ def ctr_diou_loss_1d(
     len_c = lc + rc
 
     # offset between centers
-    rho = 0.5 * (rp - lp - rg + lg)
+    rho = 0.5 * (rp - lp - rg + lg)  # 预测框中心 = 0.5*(当前坐标+rp - (当前坐标-lp)) gt框中心 = 0.5*(当前坐标+rg - (当前坐标-lg)) 0.5 * (rp - lp - rg + lg)
 
     # diou
     loss = 1.0 - iouk + torch.square(rho / len_c.clamp(min=eps))
@@ -166,3 +166,74 @@ def ctr_diou_loss_1d(
         loss = loss.sum()
 
     return loss
+
+
+
+#@torch.jit.script
+def sigmoid_point_inclusion_loss(
+    gt_offsets: torch.Tensor,
+    input_offsets: torch.Tensor,
+    point_offsets: torch.Tensor,
+    reduction: str = 'none',
+    margin: float = 1,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+        基于 Sigmoid 的点包含损失函数
+
+        该损失用于鼓励预测的 1D 区间能够包含一个已知参考点。
+        假设预测框和参考点的位置均以同一个锚点中心为基准进行偏移编码。
+
+        预测框表示形式如下：
+            (t1, t2) = (c - o_1, c + o_2)，其中 o_i >= 0
+        标注点偏移表示为：
+            point_offsets = [c - p, p - c]
+
+        当参考点位于预测框外部时，损失函数通过 sigmoid 函数对其进行惩罚；
+        点越远离预测区间，损失越大；点在区间内时，损失接近于 0。
+
+        参数:
+            input_offsets (Tensor): 模型预测的左右偏移，形状为 (N, 2)，
+                                    第 1 列为左偏移（中心点到左边界的距离），
+                                    第 2 列为右偏移（右边界到中心点的距离），必须为非负。
+            point_offsets (Tensor): 标注点相对于中心点的偏移，形状为 (N, 2)，
+                                    分别为 [c - p, p - c]。
+            reduction (str): 损失的聚合方式：
+                             'none'：返回每个样本的损失；
+                             'mean'：返回所有样本损失的平均值；
+                             'sum'：返回所有样本损失的总和。
+            margin (float): sigmoid 平滑因子，用于控制惩罚函数的过渡范围；
+                            值越大，过渡越平缓，惩罚越“软”。
+
+        返回:
+            Tensor: 返回包含每个样本的损失值，形状为 (N,)；若指定 reduction 为 'mean' 或 'sum'，则返回一个标量。
+        """
+
+    gt_offsets = gt_offsets.float()
+
+    # 计算 GT 框长度（用于设置每个样本的 loss 权重）
+    gt_lengths = gt_offsets[:, 0] + gt_offsets[:, 1]
+    weights = 1.0 / (gt_lengths + eps)  # 长框权重小，短框权重大
+
+
+    input_offsets = input_offsets.float()
+    point_offsets = point_offsets.float()
+
+
+    # 左侧：标注点距离左边界应该 <= 预测左offset
+    # 右侧：标注点距离右边界应该 <= 预测右offset
+    left_term = torch.sigmoid((point_offsets[:, 0] - input_offsets[:, 0]) / margin)
+    right_term = torch.sigmoid((point_offsets[:, 1] - input_offsets[:, 1]) / margin)
+
+
+    loss = left_term + right_term
+
+    # # 加权 loss
+    # loss = (left_term + right_term) * weights
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
+    else:
+        return loss

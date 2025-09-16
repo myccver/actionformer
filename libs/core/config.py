@@ -4,6 +4,7 @@ import yaml
 DEFAULTS = {
     # random seed for reproducibility, a large number is preferred
     "init_rand_seed": 1234567891,
+    # "init_rand_seed": 0,
     # dataset loader, specify the dataset here
     "dataset_name": "epic",
     "devices": ['cuda:0'], # default: single gpu
@@ -150,6 +151,12 @@ def _update_config(config):
     config["model"]["max_seq_len"] = config["dataset"]["max_seq_len"]
     config["model"]["train_cfg"] = config["train_cfg"]
     config["model"]["test_cfg"] = config["test_cfg"]
+
+    # 模型插入数据集信息
+    config['model']['train_cfg']['dataset_name'] = config['dataset_name']
+    config['model']['test_cfg']['dataset_name'] = config['dataset_name']
+    config['model']['train_cfg']['RAB_args'] = {'layer_num': 2, 'drop_out': 0.3, 'num_heads': 8, 'dim_feedforward': 256}
+
     return config
 
 def load_config(config_file, defaults=DEFAULTS):

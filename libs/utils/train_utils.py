@@ -93,6 +93,24 @@ def make_optimizer(model, optimizer_config):
     inter_params = decay & no_decay
     union_params = decay | no_decay
     assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params), )
+
+    # 找出未分类的参数,在这里修改
+    unclassified = param_dict.keys() - (decay | no_decay)
+
+    # 你可以选择将它们默认放入 no_decay 或 decay（根据你的需求）
+    for pn in unclassified:
+
+        #print(f"[警告] 参数 {pn} 未分类，已默认加入 no_decay。")
+        if 'self_atten.in_proj_weight' in pn or 'delta_param' in pn:
+            decay.add(pn)
+        else:
+            no_decay.add(pn)  # 保守起见：默认不加 weight decay
+
+
+    # ✅ 重新计算 union_params
+    union_params = decay | no_decay
+    #--------------------
+
     assert len(param_dict.keys() - union_params) == 0, \
         "parameters %s were not separated into either decay/no_decay set!" \
         % (str(param_dict.keys() - union_params), )
@@ -291,7 +309,7 @@ def train_one_epoch(
         # printing (only check the stats when necessary to avoid extra cost)
         if (iter_idx != 0) and (iter_idx % print_freq) == 0:
             # measure elapsed time (sync all kernels)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=model.device)
             batch_time.update((time.time() - start) / print_freq)
             start = time.time()
 
@@ -364,7 +382,8 @@ def valid_one_epoch(
     evaluator = None,
     output_file = None,
     tb_writer = None,
-    print_freq = 20
+    print_freq = 20,
+    cfg = None,
 ):
     """Test the model on the validation set"""
     # either evaluate the results or save the results
@@ -386,6 +405,8 @@ def valid_one_epoch(
     # loop over validation set
     start = time.time()
     for iter_idx, video_list in enumerate(val_loader, 0):
+        # feature_index = time * fps / feat_stride - feat_offset 这里的feature_index是以frame_index为中心帧的特征索引
+        # frame_index = (feature_index + feat_offset) * feat_stride 这里的frame_index是特征索引的中心帧
         # forward the model (wo. grad)
         with torch.no_grad():
             output = model(video_list)
@@ -406,7 +427,7 @@ def valid_one_epoch(
         # printing
         if (iter_idx != 0) and iter_idx % (print_freq) == 0:
             # measure elapsed time (sync all kernels)
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device=model.device)
             batch_time.update((time.time() - start) / print_freq)
             start = time.time()
 
@@ -421,16 +442,26 @@ def valid_one_epoch(
     results['label'] = torch.cat(results['label']).numpy()
     results['score'] = torch.cat(results['score']).numpy()
 
-    if evaluator is not None:
-        if ext_score_file is not None and isinstance(ext_score_file, str):
-            results = postprocess_results(results, ext_score_file)
-        # call the evaluator
-        _, mAP, _ = evaluator.evaluate(results, verbose=True)
-    else:
-        # dump to a pickle file that can be directly used for evaluation
-        with open(output_file, "wb") as f:
-            pickle.dump(results, f)
-        mAP = 0.0
+    # if evaluator is not None:
+    #     if ext_score_file is not None and isinstance(ext_score_file, str):
+    #         results = postprocess_results(results, ext_score_file)
+    #     # call the evaluator
+    #     _, mAP, _ = evaluator.evaluate(results, verbose=True)
+    # else:
+    #     # dump to a pickle file that can be directly used for evaluation
+    #     with open(output_file, "wb") as f:
+    #         pickle.dump(results, f)
+    #     mAP = 0.0
+
+    if ext_score_file is not None and isinstance(ext_score_file, str):
+        results = postprocess_results(results, ext_score_file)
+    # call the evaluator
+    _, mAP, _ = evaluator.evaluate(results, verbose=True)
+
+    with open(output_file, "wb") as f:
+        pickle.dump(results, f)
+
+
 
     # log mAP to tb_writer
     if tb_writer is not None:

@@ -9,8 +9,8 @@ from torch.nn import functional as F
 from .datasets import register_dataset
 from .data_utils import truncate_feats
 
-@register_dataset("epic")
-class EpicKitchensDataset(Dataset):
+@register_dataset("thumos")
+class THUMOS14Dataset(Dataset):
     def __init__(
         self,
         is_training,     # if in training mode
@@ -60,29 +60,17 @@ class EpicKitchensDataset(Dataset):
 
         # load database and select the subset
         dict_db, label_dict = self._load_json_db(self.json_file)
-        # "empty" noun categories on epic-kitchens
-        assert len(label_dict) <= num_classes
+        assert len(label_dict) == num_classes
         self.data_list = dict_db
         self.label_dict = label_dict
 
         # dataset specific attributes
-        empty_label_ids = self.find_empty_cls(label_dict, num_classes)
         self.db_attributes = {
-            'dataset_name': 'epic-kitchens-100',
-            'tiou_thresholds': np.linspace(0.1, 0.5, 5),
-            'empty_label_ids': empty_label_ids
+            'dataset_name': 'thumos-14',
+            'tiou_thresholds': np.linspace(0.3, 0.7, 5),
+            # we will mask out cliff diving
+            'empty_label_ids': [],
         }
-
-    def find_empty_cls(self, label_dict, num_classes):
-        # find categories with out a data sample
-        if len(label_dict) == num_classes:
-            return []
-        empty_label_ids = []
-        label_ids = [v for _, v in label_dict.items()]
-        for id in range(num_classes):
-            if id not in label_ids:
-                empty_label_ids.append(id)
-        return empty_label_ids
 
     def get_attributes(self):
         return self.db_attributes
@@ -106,6 +94,11 @@ class EpicKitchensDataset(Dataset):
             # skip the video if not in the split
             if value['subset'].lower() not in self.split:
                 continue
+            # or does not have the feature file
+            feat_file = os.path.join(self.feat_folder,
+                                     self.file_prefix + key + self.file_ext)
+            if not os.path.exists(feat_file):
+                continue
 
             # get fps if available
             if self.default_fps is not None:
@@ -123,13 +116,15 @@ class EpicKitchensDataset(Dataset):
 
             # get annotations if available
             if ('annotations' in value) and (len(value['annotations']) > 0):
-                num_acts = len(value['annotations'])
-                segments = np.zeros([num_acts, 2], dtype=np.float32)
-                labels = np.zeros([num_acts, ], dtype=np.int64)
-                for idx, act in enumerate(value['annotations']):
-                    segments[idx][0] = act['segment'][0]
-                    segments[idx][1] = act['segment'][1]
-                    labels[idx] = label_dict[act['label']]
+                # a fun fact of THUMOS: cliffdiving (4) is a subset of diving (7)
+                # our code can now handle this corner case
+                segments, labels = [], []
+                for act in value['annotations']:
+                    segments.append(act['segment'])
+                    labels.append([label_dict[act['label']]])
+
+                segments = np.asarray(segments, dtype=np.float32)
+                labels = np.squeeze(np.asarray(labels, dtype=np.int64), axis=1)
             else:
                 segments = None
                 labels = None
@@ -154,8 +149,7 @@ class EpicKitchensDataset(Dataset):
         # load features
         filename = os.path.join(self.feat_folder,
                                 self.file_prefix + video_item['id'] + self.file_ext)
-        with np.load(filename) as data:
-            feats = data['feats'].astype(np.float32)
+        feats = np.load(filename).astype(np.float32)
 
         # deal with downsampling (= increased feat stride)
         feats = feats[::self.downsample_rate, :]

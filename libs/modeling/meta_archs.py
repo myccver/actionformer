@@ -1,14 +1,16 @@
 import math
-
+import os
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from .models import register_meta_arch, make_backbone, make_neck, make_generator
 from .blocks import MaskedConv1D, Scale, LayerNorm
-from .losses import ctr_diou_loss_1d, sigmoid_focal_loss
+from .losses import ctr_diou_loss_1d, sigmoid_focal_loss, sigmoid_point_inclusion_loss
 
 from ..utils import batched_nms
+import numpy as np
+import pickle
 
 class PtTransformerClsHead(nn.Module):
     """
@@ -221,7 +223,7 @@ class PtTransformer(nn.Module):
 
         # training time config
         self.train_center_sample = train_cfg['center_sample']
-        assert self.train_center_sample in ['radius', 'none']
+        assert self.train_center_sample in ['radius', 'none', 'point']
         self.train_center_sample_radius = train_cfg['center_sample_radius']
         self.train_loss_weight = train_cfg['loss_weight']
         self.train_cls_prior_prob = train_cfg['cls_prior_prob']
@@ -324,6 +326,60 @@ class PtTransformer(nn.Module):
         self.loss_normalizer = train_cfg['init_loss_norm']
         self.loss_normalizer_momentum = 0.9
 
+        # point_propagate_module
+
+        assert train_cfg['dataset_name'] == test_cfg['dataset_name']
+        k=2
+        self.cluster_num = k
+        # 设置目录路径
+        folder = f"./cluster/{train_cfg['dataset_name']}/k{k}/cluster_representatives"  # 或者 cluster_representatives  cluster_centers
+        if test_cfg['ext_score_file'] == './data/anet_1.2/annotations/cuhk_val_simp_share.json':
+            folder = f"./cluster/{train_cfg['dataset_name']+'_1.2'}/k{k}/cluster_representatives"  # 或者 cluster_representatives  cluster_centers
+
+        # 遍历所有 .npy 文件，加载并收集
+        label_list = []
+        all_feats = []
+        for fname in os.listdir(folder):
+            if fname.endswith(".npy"):
+                path = os.path.join(folder, fname)
+                data = np.load(path)  # shape: (k, 2048)
+                all_feats.append(data)
+                label_list.append(os.path.splitext(fname)[0])
+        self.label_list = label_list
+        self.dataset_name = train_cfg['dataset_name']
+        with open(f'/home/yunchuan/actionformer/point_vid_cls/{self.dataset_name}_vid_cls.pkl', 'rb') as f:
+            self.vid_cls_dict = pickle.load(f)
+
+        # 拼接成一个大矩阵（在第一个维度上）
+        merged_feats = np.concatenate(all_feats, axis=0)
+        if train_cfg['dataset_name']=='thumos':
+            assert merged_feats.shape[0] == self.num_classes * k
+        if train_cfg['dataset_name'] == 'anet' and test_cfg['ext_score_file'] == './data/anet_1.3/annotations/cuhk_val_simp_share.json':
+            assert merged_feats.shape[0] == 200 * k
+
+        if train_cfg['dataset_name'] == 'anet' and test_cfg['ext_score_file'] == './data/anet_1.2/annotations/cuhk_val_simp_share.json':
+            assert merged_feats.shape[0] == 100 * k
+
+
+
+
+        # 转为 tensor
+        merged_tensor = torch.tensor(merged_feats, dtype=torch.float32)  # shape: (N, 2048)
+
+        # 设置为可训练参数
+        # self.cluster_param = nn.Parameter(merged_tensor, requires_grad=False)
+        self.cluster_param = nn.Parameter(merged_tensor, requires_grad=True)
+        # 创建一个同样 shape 的可学习参数（可随机初始化）
+        self.delta_param = nn.Parameter(torch.zeros_like(self.cluster_param))  # 或 torch.randn_like()
+
+        # # 相加得到最终的可训练特征
+        # self.dynamic_param = self.cluster_param + self.delta_param
+        from .encoder import Encoder, Reliabilty_Aware_Block
+        self.encdoer= Encoder(dataset=train_cfg['dataset_name'], feature_dim=input_dim, RAB_args=train_cfg['RAB_args'])
+
+
+
+
     @property
     def device(self):
         # a hacky way to get the device type
@@ -333,6 +389,20 @@ class PtTransformer(nn.Module):
     def forward(self, video_list):
         # batch the video list into feats (B, C, T) and masks (B, 1, T)
         batched_inputs, batched_masks = self.preprocessing(video_list)
+        # 计算prototypes mask
+        # prototype_mask = self.calculate_prototype_mask(video_list, self.cluster_num, self.dataset_name)
+        # 和点特征做cross_attn
+        # if video_list[0]['video_id'] == 'video_validation_0000413':
+        #     print(1)
+        #     pass
+        # update_batched_inputs = self.encdoer(batched_inputs, batched_masks, self.cluster_param + self.delta_param)
+        # update_batched_inputs = self.encdoer(batched_inputs, batched_masks, self.cluster_param, prototype_mask)
+        update_batched_inputs = self.encdoer(batched_inputs, batched_masks, self.cluster_param)
+
+        # 检查 NaN
+        if torch.isnan(batched_inputs).any():
+            raise ValueError("NaNs detected in batched_inputs after encoder forward pass.")
+        batched_inputs = 1 * batched_inputs + 0.1 * update_batched_inputs
 
         # forward the network (backbone -> neck -> heads)
         feats, masks = self.backbone(batched_inputs, batched_masks)
@@ -365,16 +435,30 @@ class PtTransformer(nn.Module):
             gt_segments = [x['segments'].to(self.device) for x in video_list]
             gt_labels = [x['labels'].to(self.device) for x in video_list]
 
-            # compute the gt labels for cls & reg
-            # list of prediction targets
-            gt_cls_labels, gt_offsets = self.label_points(
-                points, gt_segments, gt_labels)
 
-            # compute the loss and return
-            losses = self.losses(
+            # # compute the gt labels for cls & reg
+            # # list of prediction targets
+            # gt_cls_labels, gt_offsets = self.label_points(
+            #     points, gt_segments, gt_labels)
+
+
+            # 插入点标注
+            gt_points = [x['points'].to(self.device) for x in video_list]
+            gt_cls_labels, gt_offsets, point_offsets = self.label_points_with_point_supervision(
+                points, gt_segments, gt_labels, gt_points)
+
+
+            # # compute the loss and return
+            # losses = self.losses(
+            #     fpn_masks,
+            #     out_cls_logits, out_offsets,
+            #     gt_cls_labels, gt_offsets
+            # )
+            # return losses
+            losses = self.point_losses(
                 fpn_masks,
                 out_cls_logits, out_offsets,
-                gt_cls_labels, gt_offsets
+                gt_cls_labels, gt_offsets, point_offsets
             )
             return losses
 
@@ -385,6 +469,48 @@ class PtTransformer(nn.Module):
                 out_cls_logits, out_offsets
             )
             return results
+
+    @torch.no_grad()
+    def calculate_prototype_mask(self, video_list, cluster_num, dataset_name):
+        """
+            根据视频包含的类别，生成 prototype mask，用于选择 cluster_param 中相关特征。
+
+            Args:
+                video_list (list): 包含每个视频的字典信息。
+                cluster_num (int): 每个类别对应的簇数。
+                dataset_name (str): 当前数据集名称（可选用作日志记录或分支）。
+            Returns:
+                masks: Tensor，shape = [num_videos, len(label_list) * cluster_num]
+            """
+        label_list = self.label_list  # 所有类别名
+        total_dim = len(label_list) * cluster_num
+        all_masks = []
+
+        for video in video_list:
+            video_id = video["video_id"]
+            if video_id in self.vid_cls_dict:
+                class_names = self.vid_cls_dict[video_id]  # 当前视频中包含的类别名列表
+                mask = torch.zeros(total_dim, dtype=torch.float32)
+
+                for cls in class_names:
+                    if cls in label_list:
+                        idx = label_list.index(cls)
+                        start = idx * cluster_num
+                        end = (idx + 1) * cluster_num
+                        mask[start:end] = 1
+
+                all_masks.append(mask)
+            else:
+                print(f'{video_id} not in vid_cls_dict')
+                mask = torch.zeros(total_dim, dtype=torch.float32)
+                all_masks.append(mask)
+
+
+        all_masks = torch.stack(all_masks, dim=0)  # [num_videos, total_dim]
+        return all_masks
+
+
+
 
     @torch.no_grad()
     def preprocessing(self, video_list, padding_val=0.0):
@@ -418,6 +544,14 @@ class PtTransformer(nn.Module):
                 feats[0], padding_size, value=padding_val).unsqueeze(0)
 
         # generate the mask
+        # 广播机制,[None, :]增加一个维度（等价于 unsqueeze(0)）,将形状变为 [1, max_len]。
+        # 右边[:, None]：增加一个维度（等价于 unsqueeze(1)），将形状变为 [B, 1]。
+        # 左操作数 [1, max_len] → 广播为 [B, max_len]（复制 B 次）。
+        # 右操作数 [B, 1] → 广播为 [B, max_len]（每行复制 max_len 次）。
+        # ​比较逻辑​：
+        # 逐元素比较 torch.arange(max_len) 和 feats_lens 的值，生成布尔掩码。
+        # 若 位置索引 < 实际长度 → True（有效位置）。
+        # 否则 → False（填充位置）。
         batched_masks = torch.arange(max_len)[None, :] < feats_lens[:, None]
 
         # push to device
@@ -466,16 +600,22 @@ class PtTransformer(nn.Module):
         # compute the distance of every point to each segment boundary
         # auto broadcasting for all reg target-> F T x N x2
         gt_segs = gt_segment[None].expand(num_pts, num_gts, 2)
+        # 计算每个点和gt_box左侧点的offset
         left = concat_points[:, 0, None] - gt_segs[:, :, 0]
+        # 计算每个点和gt_box右侧点的offset
         right = gt_segs[:, :, 1] - concat_points[:, 0, None]
+        # 计算回归距离
         reg_targets = torch.stack((left, right), dim=-1)
 
+        # 这里生成mask，计算最小的offset是否大于0，如果大于0，说明点在gt范围内部。
         if self.train_center_sample == 'radius':
             # center of all segments F T x N
+            # 计算gt框的中心
             center_pts = 0.5 * (gt_segs[:, :, 0] + gt_segs[:, :, 1])
             # center sampling based on stride radius
             # compute the new boundaries:
             # concat_points[:, 3] stores the stride
+            # 重新划分gt框，设置一个半径，以原来的gt中心向两侧扩展， 边界在t_mjin和t_max内部
             t_mins = \
                 center_pts - concat_points[:, 3, None] * self.train_center_sample_radius
             t_maxs = \
@@ -484,8 +624,10 @@ class PtTransformer(nn.Module):
             # left: torch.maximum(t_mins, gt_segs[:, :, 0])
             # right: torch.minimum(t_maxs, gt_segs[:, :, 1])
             # F T x N (distance to the new boundary)
+            # 左侧点必须大于等于t_min
             cb_dist_left = concat_points[:, 0, None] \
                            - torch.maximum(t_mins, gt_segs[:, :, 0])
+            # 右侧点必须小于等于t_max
             cb_dist_right = torch.minimum(t_maxs, gt_segs[:, :, 1]) \
                             - concat_points[:, 0, None]
             # F T x N x 2
@@ -499,6 +641,7 @@ class PtTransformer(nn.Module):
 
         # limit the regression range for each location
         max_regress_distance = reg_targets.max(-1)[0]
+        # 限制回归距离不能超过预定义范围
         # F T x N
         inside_regress_range = torch.logical_and(
             (max_regress_distance >= concat_points[:, 1, None]),
@@ -530,6 +673,331 @@ class PtTransformer(nn.Module):
         reg_targets /= concat_points[:, 3, None]
 
         return cls_targets, reg_targets
+
+    @torch.no_grad()
+    def label_points_with_point_supervision(self, points, gt_segments, gt_labels, gt_points):
+        # concat points on all fpn levels List[T x 4] -> F T x 4
+        # This is shared for all samples in the mini-batch
+        num_levels = len(points)
+        concat_points = torch.cat(points, dim=0)
+        gt_cls, gt_offset = [], []
+        #
+        point_offset = []
+
+        # loop over each video sample
+        for gt_segment, gt_label, gt_point in zip(gt_segments, gt_labels, gt_points):
+            cls_targets, reg_targets, point_targets = self.label_points_single_video__with_point_supervision(
+                concat_points, gt_segment, gt_label, gt_point
+            )
+            # append to list (len = # images, each of size FT x C)
+            gt_cls.append(cls_targets)
+            gt_offset.append(reg_targets)
+            #
+            point_offset.append(point_targets)
+
+        return gt_cls, gt_offset, point_offset
+
+    @torch.no_grad()
+    def label_points_single_video__with_point_supervision(self, concat_points, gt_segment, gt_label, gt_point):
+        # concat_points : F T x 4 (t, regression range, stride)
+        # gt_segment : N (#Events) x 2
+        # gt_label : N (#Events) x 1
+        num_pts = concat_points.shape[0]
+        num_gts = gt_segment.shape[0]
+
+        # corner case where current sample does not have actions
+        if num_gts == 0:
+            cls_targets = gt_segment.new_full((num_pts, self.num_classes), 0)
+            reg_targets = gt_segment.new_zeros((num_pts, 2))
+            return cls_targets, reg_targets
+
+        # compute the lengths of all segments -> F T x N
+        lens = gt_segment[:, 1] - gt_segment[:, 0]
+        lens = lens[None, :].repeat(num_pts, 1)
+
+        # compute the distance of every point to each segment boundary
+        # auto broadcasting for all reg target-> F T x N x2
+        gt_segs = gt_segment[None].expand(num_pts, num_gts, 2)
+        # 计算每个点和gt_box左侧点的offset
+        left = concat_points[:, 0, None] - gt_segs[:, :, 0]
+        # 计算每个点和gt_box右侧点的offset
+        right = gt_segs[:, :, 1] - concat_points[:, 0, None]
+        # 计算回归距离
+        reg_targets = torch.stack((left, right), dim=-1)
+
+        # 计算point与每个特征的offset
+        gt_points = gt_point[None].expand(num_pts, num_gts)
+        left_point_offset = concat_points[:, 0, None] - gt_points
+        right_point_offset = gt_points - concat_points[:, 0, None]
+        point_targets = torch.stack((left_point_offset, right_point_offset), dim=-1)
+
+        # 这里生成mask，计算最小的offset是否大于0，如果大于0，说明点在gt范围内部。
+        if self.train_center_sample == 'radius':
+            # center of all segments F T x N
+            # 计算gt框的中心
+            center_pts = 0.5 * (gt_segs[:, :, 0] + gt_segs[:, :, 1])
+            # center sampling based on stride radius
+            # compute the new boundaries:
+            # concat_points[:, 3] stores the stride
+            # 重新划分gt框，设置一个半径，以原来的gt中心向两侧扩展， 边界在t_mjin和t_max内部
+            t_mins = \
+                center_pts - concat_points[:, 3, None] * self.train_center_sample_radius
+            t_maxs = \
+                center_pts + concat_points[:, 3, None] * self.train_center_sample_radius
+            # prevent t_mins / maxs from over-running the action boundary
+            # left: torch.maximum(t_mins, gt_segs[:, :, 0])
+            # right: torch.minimum(t_maxs, gt_segs[:, :, 1])
+            # F T x N (distance to the new boundary)
+            # 左侧点必须大于等于t_min
+            cb_dist_left = concat_points[:, 0, None] \
+                           - torch.maximum(t_mins, gt_segs[:, :, 0])
+            # 右侧点必须小于等于t_max
+            cb_dist_right = torch.minimum(t_maxs, gt_segs[:, :, 1]) \
+                            - concat_points[:, 0, None]
+            # F T x N x 2
+            center_seg = torch.stack(
+                (cb_dist_left, cb_dist_right), -1)
+            # F T x N
+            inside_gt_seg_mask = center_seg.min(-1)[0] > 0
+        elif self.train_center_sample == 'point':
+            # center of all segments F T x N
+            # 计算gt框的中心
+            center_pts = 0.5 * (gt_segs[:, :, 0] + gt_segs[:, :, 1])
+            # center sampling based on stride radius
+            # compute the new boundaries:
+            # concat_points[:, 3] stores the stride
+            # 重新划分gt框，设置一个半径，以原来的gt中心向两侧扩展， 边界在t_mjin和t_max内部
+            # t_mins = \
+            #     center_pts - concat_points[:, 3, None] * (1+((center_pts-gt_point).abs()/((gt_segment[:,1]-gt_segment[:,0])*0.5))) #(1+(gt_point-gt_segment[:,0])/(gt_segment[:,1]-gt_segment[:,0]))
+            # t_maxs = \
+            #     center_pts + concat_points[:, 3, None] * (1+((center_pts-gt_point).abs()/((gt_segment[:,1]-gt_segment[:,0])*0.5))) #(1+(gt_segment[:,1]-gt_point)/(gt_segment[:,1]-gt_segment[:,0]))
+            #
+            gt_points = gt_point[None].expand(num_pts, num_gts)
+            t_mins = \
+                gt_points - concat_points[:, 3, None] * self.train_center_sample_radius
+            t_maxs = \
+                gt_points + concat_points[:, 3, None] * self.train_center_sample_radius
+
+            # prevent t_mins / maxs from over-running the action boundary
+            # left: torch.maximum(t_mins, gt_segs[:, :, 0])
+            # right: torch.minimum(t_maxs, gt_segs[:, :, 1])
+            # F T x N (distance to the new boundary)
+            # 左侧点必须大于等于t_min
+            cb_dist_left = concat_points[:, 0, None] \
+                           - torch.maximum(t_mins, gt_segs[:, :, 0])
+            # 右侧点必须小于等于t_max
+            cb_dist_right = torch.minimum(t_maxs, gt_segs[:, :, 1]) \
+                            - concat_points[:, 0, None]
+            # F T x N x 2
+            center_seg = torch.stack(
+                (cb_dist_left, cb_dist_right), -1)
+            # F T x N
+            inside_gt_seg_mask = center_seg.min(-1)[0] > 0
+
+        else:
+            # inside an gt action
+            inside_gt_seg_mask = reg_targets.min(-1)[0] > 0
+
+        # limit the regression range for each location
+        max_regress_distance = reg_targets.max(-1)[0]
+        # 限制回归距离不能超过预定义范围
+        # F T x N
+        inside_regress_range = torch.logical_and(
+            (max_regress_distance >= concat_points[:, 1, None]),
+            (max_regress_distance <= concat_points[:, 2, None])
+        )
+
+        # if there are still more than one actions for one moment
+        # pick the one with the shortest duration (easiest to regress)
+        lens.masked_fill_(inside_gt_seg_mask == 0, float('inf'))
+        lens.masked_fill_(inside_regress_range == 0, float('inf'))
+        # F T x N -> F T
+        min_len, min_len_inds = lens.min(dim=1)
+
+        # corner case: multiple actions with very similar durations (e.g., THUMOS14)
+        min_len_mask = torch.logical_and(
+            (lens <= (min_len[:, None] + 1e-3)), (lens < float('inf'))
+        ).to(reg_targets.dtype)
+
+        # cls_targets: F T x C; reg_targets F T x 2
+        gt_label_one_hot = F.one_hot(
+            gt_label, self.num_classes
+        ).to(reg_targets.dtype)
+        cls_targets = min_len_mask @ gt_label_one_hot
+        # to prevent multiple GT actions with the same label and boundaries
+        cls_targets.clamp_(min=0.0, max=1.0)
+        # # 在这里插入point_mask
+        # # 先写point_mask的逻辑
+        # # 先生成索引
+        # adjusted_start, adjusted_end = self.compute_adjusted_bounds(gt_segment, gt_point, alpha=0.05, beta=0.05)
+        # seg_start = gt_segment[:, 0]
+        # seg_end = gt_segment[:, 1]
+        #
+        # outer_indices = self.get_outer_indices(seg_start, seg_end, adjusted_start, adjusted_end)
+        # outer_indices = torch.concat(outer_indices)
+        # outer_indices = outer_indices[(outer_indices >= 0) & (outer_indices < self.max_seq_len)]
+        # outer_indices = torch.sort(outer_indices)[0]
+        # # 然后
+        # # Step 1: 每组特征长度
+        # feat_lengths = [self.max_seq_len // s for s in self.fpn_strides]  # [2304, 1152, 576, 288, 144, 72]
+        #
+        # assert sum([i for i in feat_lengths]) == num_pts
+        #
+        # # Step 2: 每层在 cls_targets 中的起始偏移量
+        # offsets = [0] + list(torch.cumsum(torch.tensor(feat_lengths[:-1]), dim=0).tolist())
+        # # offsets = [0, 2304, 3456, 4032, 4320, 4464]
+        #
+        # # Step 3: 计算每个 gt_point 在拼接特征向量中的索引
+        # all_indices = []
+        # for stride, offset in zip(self.fpn_strides, offsets):
+        #     idx = torch.floor(outer_indices / stride).long() + offset
+        #     all_indices.append(idx)
+        # all_indices = torch.cat(all_indices).unique()
+        # total_index = torch.ones(num_pts)
+        # total_index[all_indices] = 0
+        # cls_targets = cls_targets * total_index[:,None].to(cls_targets.device)
+
+
+        # OK to use min_len_inds
+        reg_targets = reg_targets[range(num_pts), min_len_inds]
+        # normalization based on stride
+        reg_targets /= concat_points[:, 3, None]
+        # 对point_offset在做同样操作
+        point_targets = point_targets[range(num_pts), min_len_inds]
+        point_targets /= concat_points[:, 3, None]
+
+        return cls_targets, reg_targets, point_targets
+
+    def compute_adjusted_bounds(self, gt_segment, gt_point, alpha=0.3, beta=0.3):
+        """
+        gt_segment: Tensor [N, 2], 每行是 [start, end]
+        gt_point: Tensor [N], 每个对应段内的标注点
+        """
+        seg_start = gt_segment[:, 0]
+        seg_end = gt_segment[:, 1]
+        pt = gt_point
+
+        left_offset = pt - seg_start
+        right_offset = seg_end - pt
+
+        adjusted_start = torch.minimum(seg_start + alpha * left_offset, pt)
+        adjusted_end = torch.maximum(seg_end - beta * right_offset, pt)
+
+        return adjusted_start, adjusted_end
+
+    def get_outer_indices(self, seg_start, seg_end, adjusted_start, adjusted_end):
+        """
+        返回 List[Tensor]，表示每个样本中：
+        原始段内但在 adjusted 段之外的整数索引
+        """
+        results = []
+
+        for s, e, adj_s, adj_e in zip(seg_start, seg_end, adjusted_start, adjusted_end):
+            s_int = int(torch.floor(s).item())
+            e_int = int(torch.floor(e).item())
+
+            adj_s_int = int(torch.floor(adj_s).item())
+            adj_e_int = int(torch.ceil(adj_e).item())
+
+            idxs = []
+
+            if adj_s_int > s_int:
+                idxs_before = torch.arange(s_int, adj_s_int)
+                idxs.append(idxs_before)
+
+            if adj_e_int < e_int:
+                idxs_after = torch.arange(adj_e_int + 1, e_int + 1)
+                idxs.append(idxs_after)
+
+            if idxs:
+                result = torch.cat(idxs)
+            else:
+                result = torch.empty(0, dtype=torch.long)
+
+            results.append(result)
+
+        return results
+
+    def point_losses(
+        self, fpn_masks,
+        out_cls_logits, out_offsets,
+        gt_cls_labels, gt_offsets, point_offsets
+    ):
+        # fpn_masks, out_*: F (List) [B, T_i, C]
+        # gt_* : B (list) [F T, C]
+        # fpn_masks -> (B, FT)
+        valid_mask = torch.cat(fpn_masks, dim=1)
+
+        # 1. classification loss
+        # stack the list -> (B, FT) -> (# Valid, )
+        gt_cls = torch.stack(gt_cls_labels)
+        pos_mask = torch.logical_and((gt_cls.sum(-1) > 0), valid_mask)
+
+        # cat the predicted offsets -> (B, FT, 2 (xC)) -> # (#Pos, 2 (xC))
+        pred_offsets = torch.cat(out_offsets, dim=1)[pos_mask]
+        gt_offsets = torch.stack(gt_offsets)[pos_mask]
+
+        point_offsets = torch.stack(point_offsets)[pos_mask]
+
+        # update the loss normalizer
+        num_pos = pos_mask.sum().item()
+        self.loss_normalizer = self.loss_normalizer_momentum * self.loss_normalizer + (
+            1 - self.loss_normalizer_momentum
+        ) * max(num_pos, 1)
+
+        # gt_cls is already one hot encoded now, simply masking out
+        gt_target = gt_cls[valid_mask]
+
+        # optinal label smoothing
+        gt_target *= 1 - self.train_label_smoothing
+        gt_target += self.train_label_smoothing / (self.num_classes + 1)
+
+        # focal loss
+        cls_loss = sigmoid_focal_loss(
+            torch.cat(out_cls_logits, dim=1)[valid_mask],
+            gt_target,
+            reduction='sum'
+        )
+        cls_loss /= self.loss_normalizer
+
+        # 2. regression using IoU/GIoU loss (defined on positive samples)
+        if num_pos == 0:
+            reg_loss = 0 * pred_offsets.sum()
+        else:
+            # giou loss defined on positive samples
+            reg_loss = ctr_diou_loss_1d(
+                pred_offsets,
+                gt_offsets,
+                reduction='sum'
+            )
+            reg_loss /= self.loss_normalizer
+
+        if self.train_loss_weight > 0:
+            loss_weight = self.train_loss_weight
+        else:
+            loss_weight = cls_loss.detach() / max(reg_loss.item(), 0.01)
+
+        #
+        if num_pos == 0:
+            point_loss = 0 * pred_offsets.sum()
+        else:
+            # point_loss
+            point_loss = sigmoid_point_inclusion_loss(
+                gt_offsets,
+                pred_offsets,
+                point_offsets,
+                reduction='sum'
+                # reduction='mean'
+            )
+            point_loss /= self.loss_normalizer
+
+
+        # return a dict of losses
+        final_loss = cls_loss + reg_loss * loss_weight + point_loss * loss_weight * 0.01  #* 0.01
+        return {'cls_loss'   : cls_loss,
+                'reg_loss'   : reg_loss,
+                'point_loss' : point_loss,
+                'final_loss' : final_loss}
 
     def losses(
         self, fpn_masks,
@@ -655,6 +1123,7 @@ class PtTransformer(nn.Module):
         cls_idxs_all = []
 
         # loop over fpn levels
+        # 取不同层金字塔的预测类别分数，预测偏移，anchor，掩码
         for cls_i, offsets_i, pts_i, mask_i in zip(
                 out_cls_logits, out_offsets, points, fpn_masks
             ):
@@ -674,9 +1143,11 @@ class PtTransformer(nn.Module):
             topk_idxs = topk_idxs[idxs[:num_topk]].clone()
 
             # fix a warning in pytorch 1.9
+            # 计算snippet位置
             pt_idxs =  torch.div(
                 topk_idxs, self.num_classes, rounding_mode='floor'
             )
+            # 计算类别标签
             cls_idxs = torch.fmod(topk_idxs, self.num_classes)
 
             # 3. gather predicted offsets

@@ -1,10 +1,11 @@
+init_rand_seed: 0
 dataset_name: anet
 train_split: ['training']
 val_split: ['validation']
-"devices": ['cuda:1']
+"devices": ['cuda:5']
 dataset: {
-  json_file: ./data/anet_1.3/annotations/anet1.3_tsp_filtered.json,
-  feat_folder: ./data/anet_1.3/tsp_features,
+  json_file: ./data/anet_1.2/annotations/anet1.2_fake_gt.json,
+  feat_folder: ./data/anet_1.2/tsp_features,
   file_prefix: v_,
   file_ext: .npy,
   num_classes: 1,
@@ -17,6 +18,7 @@ dataset: {
   # upsample the features to a fixed length of 192
   max_seq_len: 192,
   force_upsampling: True,
+#  force_upsampling: False,
 }
 model: {
   fpn_type: identity,
@@ -37,7 +39,7 @@ opt: {
 }
 loader: {
   batch_size: 16,
-  "num_workers": 4,
+  "num_workers": 0,
 }
 train_cfg: {
   init_loss_norm: 200,
@@ -60,7 +62,7 @@ test_cfg: {
   # score fusion
   multiclass_nms: False,
   nms_sigma : 0.75,
-  ext_score_file: ./data/anet_1.3/annotations/cuhk_val_simp_share.json,
+  ext_score_file: ./data/anet_1.2/annotations/cuhk_val_simp_share.json,
   duration_thresh: 0.001,
 }
 output_folder: ./ckpt/

@@ -58,11 +58,21 @@ def main(args):
         val_dataset, False, None, 1, cfg['loader']['num_workers']
     )
 
+    # #---train
+    # val_dataset = make_dataset(
+    #     cfg['dataset_name'], False, cfg['train_split'], **cfg['dataset']
+    # )
+    #
+    # # data loaders
+    # val_loader = make_data_loader(
+    #     val_dataset, False,None, 1, cfg['loader']['num_workers'])
+
     """3. create model and evaluator"""
     # model
     model = make_meta_arch(cfg['model_name'], **cfg['model'])
     # not ideal for multi GPU training, ok for now
-    model = nn.DataParallel(model, device_ids=cfg['devices'])
+    # model = nn.DataParallel(model, device_ids=cfg['devices'])
+    model = model.to(cfg['devices'][0])
 
     """4. load ckpt"""
     print("=> loading checkpoint '{}'".format(ckpt_file))
@@ -78,15 +88,25 @@ def main(args):
 
     # set up evaluator
     det_eval, output_file = None, None
-    if not args.saveonly:
-        val_db_vars = val_dataset.get_attributes()
-        det_eval = ANETdetection(
-            val_dataset.json_file,
-            val_dataset.split[0],
-            tiou_thresholds = val_db_vars['tiou_thresholds']
-        )
-    else:
-        output_file = os.path.join(os.path.split(ckpt_file)[0], 'eval_results.pkl')
+    # if not args.saveonly:
+    #     val_db_vars = val_dataset.get_attributes()
+    #     det_eval = ANETdetection(
+    #         val_dataset.json_file,
+    #         val_dataset.split[0],
+    #         tiou_thresholds = val_db_vars['tiou_thresholds']
+    #     )
+    # else:
+    #     output_file = os.path.join(os.path.split(ckpt_file)[0], 'eval_results.pkl')
+
+    val_db_vars = val_dataset.get_attributes()
+    det_eval = ANETdetection(
+        val_dataset.json_file,
+        val_dataset.split[0],
+        tiou_thresholds=val_db_vars['tiou_thresholds']
+    )
+    output_file = os.path.join(os.path.split(ckpt_file)[0], 'eval_results.pkl')
+
+
 
     """5. Test the model"""
     print("\nStart testing model {:s} ...".format(cfg['model_name']))
@@ -99,7 +119,9 @@ def main(args):
         output_file=output_file,
         ext_score_file=cfg['test_cfg']['ext_score_file'],
         tb_writer=None,
-        print_freq=args.print_freq
+        print_freq=args.print_freq,
+        cfg=cfg,
+
     )
     end = time.time()
     print("All done! Total time: {:0.2f} sec".format(end - start))
